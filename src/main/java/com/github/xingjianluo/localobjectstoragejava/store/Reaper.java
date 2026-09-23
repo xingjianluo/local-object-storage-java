@@ -7,8 +7,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -114,27 +112,4 @@ public class Reaper {
         return new int[]{sessions, blobs};
     }
 
-    /**
-     * 清理 tmp 目录下遗留的合并临时文件（例如上次进程在合并中被 kill）。
-     */
-    public int cleanupStaging(Path tmpDir) {
-        if (!Files.isDirectory(tmpDir)) {
-            return 0;
-        }
-        int removed = 0;
-        try (var entries = Files.list(tmpDir)) {
-            for (Path p : entries.toList()) {
-                try {
-                    if (Files.deleteIfExists(p)) {
-                        removed++;
-                    }
-                } catch (Exception e) {
-                    log.warn("清理暂存文件失败 {}", p, e);
-                }
-            }
-        } catch (Exception e) {
-            log.warn("扫描暂存目录失败 {}", tmpDir, e);
-        }
-        return removed;
-    }
 }
