@@ -17,9 +17,12 @@ import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestParam;
+import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
+import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.io.InputStream;
@@ -75,8 +78,10 @@ public class StorageController {
                                            @RequestHeader("X-Part-Size") long partSize,
                                            @RequestHeader(value = "X-Part-Checksum", required = false)
                                            String checksum,
-                                           InputStream body) {
-        UploadSession session = multipartUploadService.uploadPart(sid, number, partSize, checksum, body);
+                                           HttpServletRequest request) throws java.io.IOException {
+        // 直接使用原始请求体流，不经过 HttpMessageConverter，支持任意 Content-Type。
+        UploadSession session = multipartUploadService.uploadPart(sid, number, partSize, checksum,
+                request.getInputStream());
         return toSessionResponse(session);
     }
 
