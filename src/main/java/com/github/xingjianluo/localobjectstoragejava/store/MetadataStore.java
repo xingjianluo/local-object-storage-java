@@ -15,6 +15,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Function;
 import java.util.function.UnaryOperator;
 
 /**
@@ -87,6 +88,15 @@ public class MetadataStore {
             return jsonCodec.fromJson(Files.readString(file, StandardCharsets.UTF_8), ObjectMeta.class);
         } catch (IOException e) {
             throw new UncheckedIOException("读取对象元数据失败: " + key, e);
+        }
+    }
+
+    /**
+     * 在 key 锁内只读地执行解析，用于“锁内确定版本/contentId，锁外读 blob”的读取路径。
+     */
+    public <T> T withKeyLock(String key, Function<ObjectMeta, T> reader) {
+        synchronized (lockOf(key)) {
+            return reader.apply(load(key));
         }
     }
 
