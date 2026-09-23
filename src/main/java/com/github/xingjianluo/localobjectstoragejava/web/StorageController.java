@@ -36,11 +36,11 @@ import java.util.List;
  * 完成合并  POST   /api/uploads/{sid}/complete             body: {"checksum":"整体SHA-256"}
  * 中止会话  DELETE /api/uploads/{sid}
  * 查询会话  GET    /api/uploads/{sid}
- * 读当前版  GET    /api/objects/{key}/current
- * 读指定版  GET    /api/objects/{key}/versions/{vid}
- * 版本列表  GET    /api/objects/{key}
- * 删除版本  DELETE /api/objects/{key}/versions/{vid}
- * 版本回滚  POST   /api/objects/{key}/rollback             body: {"versionId":"..."}
+ * 读当前版  GET    /api/objects/current?key=
+ * 读指定版  GET    /api/objects/versions/{vid}?key=
+ * 版本列表  GET    /api/objects?key=
+ * 删除版本  DELETE /api/objects/versions/{vid}?key=
+ * 版本回滚  POST   /api/objects/rollback?key=             body: {"versionId":"..."}
  * 手动回收  POST   /api/admin/reap
  * </pre>
  */
@@ -101,30 +101,30 @@ public class StorageController {
 
     // ---------------- 对象与版本 ----------------
 
-    @GetMapping("/objects/{key}/current")
-    public ResponseEntity<org.springframework.core.io.Resource> readCurrent(@PathVariable String key) {
+    @GetMapping("/objects/current")
+    public ResponseEntity<org.springframework.core.io.Resource> readCurrent(@RequestParam String key) {
         return objectResponse(objectService.readCurrent(key));
     }
 
-    @GetMapping("/objects/{key}/versions/{vid}")
-    public ResponseEntity<org.springframework.core.io.Resource> readVersion(@PathVariable String key,
+    @GetMapping("/objects/versions/{vid}")
+    public ResponseEntity<org.springframework.core.io.Resource> readVersion(@RequestParam String key,
                                                                             @PathVariable String vid) {
         return objectResponse(objectService.readVersion(key, vid));
     }
 
-    @GetMapping("/objects/{key}")
-    public Dtos.ObjectMetaResponse versions(@PathVariable String key) {
+    @GetMapping("/objects")
+    public Dtos.ObjectMetaResponse versions(@RequestParam String key) {
         return toMetaResponse(objectService.listVersions(key));
     }
 
-    @DeleteMapping("/objects/{key}/versions/{vid}")
-    public ResponseEntity<Void> deleteVersion(@PathVariable String key, @PathVariable String vid) {
+    @DeleteMapping("/objects/versions/{vid}")
+    public ResponseEntity<Void> deleteVersion(@RequestParam String key, @PathVariable String vid) {
         objectService.deleteVersion(key, vid);
         return ResponseEntity.noContent().build();
     }
 
-    @PostMapping("/objects/{key}/rollback")
-    public Dtos.VersionResponse rollback(@PathVariable String key,
+    @PostMapping("/objects/rollback")
+    public Dtos.VersionResponse rollback(@RequestParam String key,
                                          @RequestBody Dtos.RollbackRequest request) {
         return toVersionResponse(objectService.rollback(key, request.versionId()));
     }

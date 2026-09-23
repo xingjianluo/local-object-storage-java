@@ -100,11 +100,11 @@ public class MultipartUploadService {
         // 也保证会话元数据不会记录一个校验失败的分片。
         Path sessionPartsDir = sessionStore.partPath(sessionId, partNumber).getParent();
         Path tmp = null;
+        long actualSize = -1;
+        String actualChecksum = null;
         try {
             Files.createDirectories(sessionPartsDir);
             tmp = Files.createTempFile(sessionPartsDir, "upload-", ".tmp");
-            long actualSize;
-            String actualChecksum;
             try (InputStream in = new BoundedInputStream(new BufferedInputStream(content), expectedSize)) {
                 actualSize = Files.copy(in, tmp, StandardCopyOption.REPLACE_EXISTING);
                 try (InputStream checkIn = Files.newInputStream(tmp)) {
@@ -137,8 +137,10 @@ public class MultipartUploadService {
             throw e;
         }
 
-        final long finalExpectedSize = expectedSize;
-        final String finalChecksum = expectedChecksum;
+        // 以下锁内判定一律以“实际落盘内容”的大小/checksum 为准，
+        // 避免“旧声明 + 篡改内容”的重试被误判为幂等。
+        final long finalActualSize = actualSize;
+        final String finalActualChecksum = actualChecksum;
         final Path finalTmp = tmp;
         UploadSession updated = sessionStore.mutate(sessionId, session -> {
             switch (session.getState()) {
@@ -155,32 +157,33 @@ public class MultipartUploadService {
             }
             PartInfo existing = session.getParts().get(partNumber);
             if (existing != null) {
-                if (existing.sameContent(finalExpectedSize, finalChecksum)) {
-                    // 同编号同内容 = 客户端重试，幂等成功，临时文件直接丢弃。
+                if (existing.sameContent(finalActualSize, finalActualChecksum)) {
+                    // 同编号且本次上传内容与已存内容逐字节同值（size+checksum 一致）= 客户端重试，
+                    // 幂等成功，临时文件直接丢弃。
                     deleteQuietly(finalTmp);
                     log.info("分片重复上传(幂等) sid={} part={} size={} checksum={}",
-                            sessionId, partNumber, finalExpectedSize, finalChecksum);
+                            sessionId, partNumber, finalActualSize, finalActualChecksum);
                     return session;
                 }
                 deleteQuietly(finalTmp);
                 throw new StorageException(ErrorCode.PART_CONFLICT,
                         String.format("分片 %d 已存在且内容不同: existing(size=%d,sha=%s) incoming(size=%d,sha=%s)",
                                 partNumber, existing.getSize(), existing.getChecksum(),
-                                finalExpectedSize, finalChecksum));
+                                finalActualSize, finalActualChecksum));
             }
             // 大小规则：非最后一片必须恰好 partSize；最后一片 1..partSize。
             boolean isLast = partNumber == session.getTotalParts();
-            if (!isLast && finalExpectedSize != session.getPartSize()) {
+            if (!isLast && finalActualSize != session.getPartSize()) {
                 deleteQuietly(finalTmp);
                 throw new StorageException(ErrorCode.PART_SIZE_MISMATCH,
                         String.format("非末尾分片 %d 必须恰好为 partSize=%d，实际=%d",
-                                partNumber, session.getPartSize(), finalExpectedSize));
+                                partNumber, session.getPartSize(), finalActualSize));
             }
-            if (isLast && (finalExpectedSize <= 0 || finalExpectedSize > session.getPartSize())) {
+            if (isLast && (finalActualSize <= 0 || finalActualSize > session.getPartSize())) {
                 deleteQuietly(finalTmp);
                 throw new StorageException(ErrorCode.PART_SIZE_MISMATCH,
                         String.format("末尾分片 %d 大小必须在 1..partSize(%d) 内，实际=%d",
-                                partNumber, session.getPartSize(), finalExpectedSize));
+                                partNumber, session.getPartSize(), finalActualSize));
             }
             Path target = sessionStore.partPath(sessionId, partNumber);
             try {
@@ -190,7 +193,7 @@ public class MultipartUploadService {
                 throw new UncheckedIOException("提交分片失败: " + partNumber, e);
             }
             session.getParts().put(partNumber,
-                    sessionStore.newPartInfo(partNumber, finalExpectedSize, finalChecksum));
+                    sessionStore.newPartInfo(partNumber, finalActualSize, finalActualChecksum));
             log.info("分片已提交 sid={} part={} 已收齐 {}/{}",
                     sessionId, partNumber, session.getParts().size(), session.getTotalParts());
             return session;
