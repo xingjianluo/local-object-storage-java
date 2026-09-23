@@ -129,6 +129,18 @@ public class SessionStore {
         }
     }
 
+    /**
+     * 只删除分片数据目录，保留 session.json（用于终态后的重复请求给出可区分错误）。
+     */
+    public void removeParts(String sessionId) {
+        synchronized (lockOf(sessionId)) {
+            Path parts = sessionDir(sessionId).resolve("parts");
+            deleteRecursively(parts);
+            // 删除遗留的 upload-*.tmp（失败重试残留）。
+            log.debug("已清理分片数据 sid={}", sessionId);
+        }
+    }
+
     public void removeSession(String sessionId) {
         synchronized (lockOf(sessionId)) {
             deleteRecursively(sessionDir(sessionId));
