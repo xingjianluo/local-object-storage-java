@@ -37,3 +37,5 @@ build/
 
 ### Mac OS ###
 .DS_Store
+### 本地对象存储运行时数据 ###
+data/
