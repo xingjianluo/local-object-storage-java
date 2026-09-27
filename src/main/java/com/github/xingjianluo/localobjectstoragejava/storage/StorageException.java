@@ -17,6 +17,7 @@ public class StorageException extends RuntimeException {
         OBJECT_NOT_FOUND,
         VERSION_NOT_FOUND,
         CONTENT_MISSING,
+        RANGE_NOT_SATISFIABLE,
         STORAGE_CORRUPT
     }
 

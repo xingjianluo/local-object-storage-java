@@ -29,6 +29,12 @@ public interface ContentStore {
     InputStream open(String contentId);
 
     /**
+     * 打开内容的字节区间 [offset, offset+length) 读取流，流式读取、内存占用与区间大小无关。
+     * 内容不存在时抛出 CONTENT_MISSING；调用方需保证区间落在内容长度之内。
+     */
+    InputStream openRange(String contentId, long offset, long length);
+
+    /**
      * 内容字节数；不存在返回 -1。
      */
     long sizeOf(String contentId);
@@ -42,4 +48,14 @@ public interface ContentStore {
      * 回收引用计数为零且不可达的内容，返回回收的内容标识列表。
      */
     java.util.List<String> sweep();
+
+    /**
+     * 启动对账（进程启动时、无任何并发读写的前提下调用）：
+     * 以版本链实际引用为准校正全部引用计数并持久化——崩溃可能留下
+     * “已落盘但未计数”或“已计数但无版本引用”的残留，统一校正后由
+     * {@link #sweep()} 回收零引用内容；同时清理写入中断遗留的临时文件。
+     *
+     * @param expectedRefCounts 版本链统计出的 contentId -> 引用次数
+     */
+    void reconcile(Map<String, Integer> expectedRefCounts);
 }

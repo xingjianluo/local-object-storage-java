@@ -1,7 +1,9 @@
 package com.github.xingjianluo.localobjectstoragejava.storage;
 
 import jakarta.servlet.http.HttpServletRequest;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.ExceptionHandler;
@@ -10,9 +12,11 @@ import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -80,19 +84,100 @@ public class StorageController {
     }
 
     @GetMapping("/objects/{objectKey}/data")
-    public ResponseEntity<byte[]> readLatest(@PathVariable String objectKey) throws IOException {
-        ObjectStorageService.ObjectData data = objectStorageService.readLatest(objectKey);
-        try (InputStream in = data.stream()) {
-            return ResponseEntity.ok(in.readAllBytes());
+    public ResponseEntity<StreamingResponseBody> readLatest(
+            @PathVariable String objectKey,
+            @RequestHeader(value = "Range", required = false) String rangeHeader) {
+        if (rangeHeader != null) {
+            ObjectStorageService.VersionInfo info = objectStorageService.statLatest(objectKey);
+            long[] range = parseRangeHeader(rangeHeader, info.size());
+            return rangeResponse(objectStorageService.readLatestRange(objectKey, range[0], range[1]));
         }
+        return fullResponse(objectStorageService.readLatest(objectKey));
     }
 
     @GetMapping("/objects/{objectKey}/versions/{versionId}/data")
-    public ResponseEntity<byte[]> readVersion(@PathVariable String objectKey,
-                                              @PathVariable String versionId) throws IOException {
-        ObjectStorageService.ObjectData data = objectStorageService.readVersion(objectKey, versionId);
-        try (InputStream in = data.stream()) {
-            return ResponseEntity.ok(in.readAllBytes());
+    public ResponseEntity<StreamingResponseBody> readVersion(
+            @PathVariable String objectKey,
+            @PathVariable String versionId,
+            @RequestHeader(value = "Range", required = false) String rangeHeader) {
+        if (rangeHeader != null) {
+            ObjectStorageService.VersionInfo info = objectStorageService.statVersion(objectKey, versionId);
+            long[] range = parseRangeHeader(rangeHeader, info.size());
+            return rangeResponse(objectStorageService.readVersionRange(objectKey, versionId, range[0], range[1]));
+        }
+        return fullResponse(objectStorageService.readVersion(objectKey, versionId));
+    }
+
+    /** 整包下载：流式写出，内存占用与对象大小无关。 */
+    private ResponseEntity<StreamingResponseBody> fullResponse(ObjectStorageService.ObjectData data) {
+        StreamingResponseBody body = out -> {
+            try (InputStream in = data.stream()) {
+                in.transferTo(out);
+            }
+        };
+        return ResponseEntity.ok()
+                .contentType(MediaType.APPLICATION_OCTET_STREAM)
+                .contentLength(data.version().size())
+                .header(HttpHeaders.ACCEPT_RANGES, "bytes")
+                .body(body);
+    }
+
+    /** 范围下载：206 + Content-Range，流式写出。 */
+    private ResponseEntity<StreamingResponseBody> rangeResponse(ObjectStorageService.RangeData data) {
+        StreamingResponseBody body = out -> {
+            try (InputStream in = data.stream()) {
+                in.transferTo(out);
+            }
+        };
+        long end = data.offset() + data.length() - 1;
+        return ResponseEntity.status(HttpStatus.PARTIAL_CONTENT)
+                .contentType(MediaType.APPLICATION_OCTET_STREAM)
+                .contentLength(data.length())
+                .header(HttpHeaders.ACCEPT_RANGES, "bytes")
+                .header(HttpHeaders.CONTENT_RANGE,
+                        "bytes " + data.offset() + "-" + end + "/" + data.totalSize())
+                .body(body);
+    }
+
+    /**
+     * 解析 {@code Range: bytes=start-end | bytes=start- | bytes=-suffix}，
+     * 返回 {offset, length}；格式非法时抛 RANGE_NOT_SATISFIABLE（映射为 416）。
+     */
+    public static long[] parseRangeHeader(String header, long totalSize) {
+        String h = header.trim();
+        if (!h.regionMatches(true, 0, "bytes=", 0, "bytes=".length())) {
+            throw new StorageException(StorageException.ErrorCode.RANGE_NOT_SATISFIABLE,
+                    "无法识别的 Range 头: " + header);
+        }
+        String spec = h.substring("bytes=".length()).trim();
+        int dash = spec.indexOf('-');
+        if (dash < 0 || spec.indexOf(',', 0) >= 0) {
+            throw new StorageException(StorageException.ErrorCode.RANGE_NOT_SATISFIABLE,
+                    "无法识别的 Range 头: " + header);
+        }
+        String startPart = spec.substring(0, dash).trim();
+        String endPart = spec.substring(dash + 1).trim();
+        try {
+            if (startPart.isEmpty()) {
+                // 后缀范围：最后 N 字节
+                long suffix = Long.parseLong(endPart);
+                if (suffix <= 0) {
+                    throw new NumberFormatException("suffix <= 0");
+                }
+                long offset = Math.max(0, totalSize - suffix);
+                return new long[]{offset, totalSize - offset};
+            }
+            long start = Long.parseLong(startPart);
+            long length = endPart.isEmpty()
+                    ? totalSize - start
+                    : Long.parseLong(endPart) - start + 1;
+            if (start < 0 || (!endPart.isEmpty() && length <= 0)) {
+                throw new NumberFormatException("invalid range bounds");
+            }
+            return new long[]{start, length};
+        } catch (NumberFormatException e) {
+            throw new StorageException(StorageException.ErrorCode.RANGE_NOT_SATISFIABLE,
+                    "无法识别的 Range 头: " + header);
         }
     }
 
@@ -118,6 +203,7 @@ public class StorageController {
                     HttpStatus.NOT_FOUND;
             case SESSION_EXPIRED, SESSION_ALREADY_COMPLETED, SESSION_ALREADY_ABORTED ->
                     HttpStatus.CONFLICT;
+            case RANGE_NOT_SATISFIABLE -> HttpStatus.REQUESTED_RANGE_NOT_SATISFIABLE;
             default -> HttpStatus.BAD_REQUEST;
         };
         return ResponseEntity.status(status)

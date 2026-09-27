@@ -180,6 +180,11 @@ public class LocalContentStore implements ContentStore {
 
     @Override
     public InputStream open(String contentId) {
+        return openRange(contentId, 0, Long.MAX_VALUE);
+    }
+
+    @Override
+    public InputStream openRange(String contentId, long offset, long length) {
         // 先加读钉再打开文件：回收线程不会删除有读钉的内容
         synchronized (lockOf(contentId)) {
             Integer count = refCounts.get(contentId);
@@ -191,16 +196,78 @@ public class LocalContentStore implements ContentStore {
         }
         try {
             InputStream raw = Files.newInputStream(blobPath(contentId));
-            return new FilterInputStream(raw) {
-                @Override
-                public void close() throws IOException {
-                    super.close();
-                    unpin(contentId);
+            long toSkip = offset;
+            while (toSkip > 0) {
+                long skipped = raw.skip(toSkip);
+                if (skipped <= 0) {
+                    if (raw.read() == -1) {
+                        throw new IOException("内容长度不足，无法定位到偏移 " + offset);
+                    }
+                    skipped = 1;
                 }
-            };
+                toSkip -= skipped;
+            }
+            return new BoundedPinStream(raw, contentId, length);
         } catch (IOException e) {
             unpin(contentId);
             throw new UncheckedIOException(e);
+        }
+    }
+
+    /** 限制可读字节数的读取流，关闭时释放底层流与读钉（幂等）。 */
+    private final class BoundedPinStream extends FilterInputStream {
+        private final String contentId;
+        private long remaining;
+        private boolean closed;
+
+        BoundedPinStream(InputStream raw, String contentId, long length) {
+            super(raw);
+            this.contentId = contentId;
+            this.remaining = length;
+        }
+
+        @Override
+        public int read() throws IOException {
+            if (remaining <= 0) {
+                return -1;
+            }
+            int b = super.read();
+            if (b != -1) {
+                remaining--;
+            }
+            return b;
+        }
+
+        @Override
+        public int read(byte[] b, int off, int len) throws IOException {
+            if (remaining <= 0) {
+                return -1;
+            }
+            int n = super.read(b, off, (int) Math.min(len, remaining));
+            if (n > 0) {
+                remaining -= n;
+            }
+            return n;
+        }
+
+        @Override
+        public long skip(long n) throws IOException {
+            long skipped = super.skip(Math.min(n, remaining));
+            remaining -= skipped;
+            return skipped;
+        }
+
+        @Override
+        public synchronized void close() throws IOException {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            try {
+                super.close();
+            } finally {
+                unpin(contentId);
+            }
         }
     }
 
@@ -243,6 +310,60 @@ public class LocalContentStore implements ContentStore {
             }
         }
         return removed;
+    }
+
+    @Override
+    public void reconcile(Map<String, Integer> expectedRefCounts) {
+        // 1. 清理写入中断遗留的临时文件（put-*.part）
+        try (var stream = Files.list(tmpDir)) {
+            for (Path tmp : stream.toList()) {
+                deleteQuietly(tmp);
+                log.info("对账：清理临时文件 {}", tmp.getFileName());
+            }
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+        // 2. 以版本链引用为准重建引用计数；磁盘上存在但未被引用的内容按 0 引用纳入管理
+        //    （崩溃可能发生在“落盘”与“计数”之间），随后由 sweep 回收
+        Map<String, Integer> rebuilt = new HashMap<>(expectedRefCounts);
+        try (var stream = Files.list(blobDir)) {
+            for (Path blob : stream.filter(p -> !p.getFileName().toString().endsWith(".ref")).toList()) {
+                String id = blob.getFileName().toString();
+                if (!rebuilt.containsKey(id) && !refCounts.containsKey(id)) {
+                    log.warn("对账：发现未跟踪的内容残留 {}，按 0 引用处理", id);
+                }
+                rebuilt.putIfAbsent(id, 0);
+            }
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+        refCounts.clear();
+        for (Map.Entry<String, Integer> e : rebuilt.entrySet()) {
+            String contentId = e.getKey();
+            int count = e.getValue();
+            if (!Files.exists(blobPath(contentId))) {
+                // 版本链引用了内容但数据文件丢失：保留计数，读取时会以 CONTENT_MISSING 明确失败
+                log.error("对账：内容 {} 被引用 {} 次但数据文件缺失", contentId, count);
+            }
+            refCounts.put(contentId, count);
+            persistRefCount(contentId, count);
+        }
+        // 3. 删除已不属于任何内容的孤儿 .ref 文件
+        try (var stream = Files.list(blobDir)) {
+            for (Path refFile : stream.filter(p -> p.getFileName().toString().endsWith(".ref")).toList()) {
+                String id = refFile.getFileName().toString();
+                id = id.substring(0, id.length() - ".ref".length());
+                if (!refCounts.containsKey(id)) {
+                    deleteQuietly(refFile);
+                    log.info("对账：清理孤儿引用计数文件 {}", refFile.getFileName());
+                }
+            }
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+        log.info("对账完成：跟踪 {} 个内容，其中零引用 {} 个（待回收）",
+                refCounts.size(),
+                refCounts.values().stream().filter(c -> c == 0).count());
     }
 
     private static MessageDigest newDigest() {

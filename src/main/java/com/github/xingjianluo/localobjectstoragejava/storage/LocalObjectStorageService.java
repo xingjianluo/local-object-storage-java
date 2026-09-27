@@ -74,6 +74,8 @@ public class LocalObjectStorageService implements ObjectStorageService {
     private void loadAll() throws IOException {
         try (var stream = Files.list(objectsDir)) {
             for (Path dir : stream.filter(Files::isDirectory).toList()) {
+                // 清理元数据写入中断遗留的临时文件
+                Files.deleteIfExists(dir.resolve("meta.json.tmp"));
                 Path metaFile = dir.resolve("meta.json");
                 if (Files.exists(metaFile)) {
                     ObjectMeta meta = mapper.readValue(metaFile.toFile(), ObjectMeta.class);
@@ -160,6 +162,75 @@ public class LocalObjectStorageService implements ObjectStorageService {
             VersionEntry entry = findEntry(objectKey, versionId);
             return new ObjectData(toInfo(objectKey, entry), contentStore.open(entry.contentId));
         }
+    }
+
+    @Override
+    public RangeData readLatestRange(String objectKey, long offset, long length) {
+        synchronized (lockOf(objectKey)) {
+            ObjectMeta meta = metas.get(objectKey);
+            if (meta == null || meta.versions.isEmpty()) {
+                throw new StorageException(StorageException.ErrorCode.OBJECT_NOT_FOUND,
+                        "对象不存在: " + objectKey);
+            }
+            VersionEntry latest = meta.versions.get(meta.versions.size() - 1);
+            return openRange(objectKey, latest, offset, length);
+        }
+    }
+
+    @Override
+    public RangeData readVersionRange(String objectKey, String versionId, long offset, long length) {
+        synchronized (lockOf(objectKey)) {
+            VersionEntry entry = findEntry(objectKey, versionId);
+            return openRange(objectKey, entry, offset, length);
+        }
+    }
+
+    /** 在对象锁内调用：校验范围并打开定界读取流。 */
+    private RangeData openRange(String objectKey, VersionEntry entry, long offset, long length) {
+        if (offset < 0 || length <= 0) {
+            throw new StorageException(StorageException.ErrorCode.RANGE_NOT_SATISFIABLE,
+                    "非法范围: offset=" + offset + " length=" + length);
+        }
+        if (offset >= entry.size) {
+            throw new StorageException(StorageException.ErrorCode.RANGE_NOT_SATISFIABLE,
+                    "起始位置 " + offset + " 超出对象长度 " + entry.size);
+        }
+        long actualLength = Math.min(length, entry.size - offset);
+        boolean hasMore = offset + actualLength < entry.size;
+        return new RangeData(toInfo(objectKey, entry), entry.size, offset, actualLength,
+                hasMore, contentStore.openRange(entry.contentId, offset, actualLength));
+    }
+
+    @Override
+    public VersionInfo statLatest(String objectKey) {
+        synchronized (lockOf(objectKey)) {
+            ObjectMeta meta = metas.get(objectKey);
+            if (meta == null || meta.versions.isEmpty()) {
+                throw new StorageException(StorageException.ErrorCode.OBJECT_NOT_FOUND,
+                        "对象不存在: " + objectKey);
+            }
+            return toInfo(objectKey, meta.versions.get(meta.versions.size() - 1));
+        }
+    }
+
+    @Override
+    public VersionInfo statVersion(String objectKey, String versionId) {
+        synchronized (lockOf(objectKey)) {
+            return toInfo(objectKey, findEntry(objectKey, versionId));
+        }
+    }
+
+    @Override
+    public java.util.Map<String, Integer> contentReferences() {
+        java.util.Map<String, Integer> refs = new java.util.HashMap<>();
+        for (ObjectMeta meta : metas.values()) {
+            synchronized (lockOf(meta.objectKey)) {
+                for (VersionEntry e : meta.versions) {
+                    refs.merge(e.contentId, 1, Integer::sum);
+                }
+            }
+        }
+        return refs;
     }
 
     private VersionEntry findEntry(String objectKey, String versionId) {

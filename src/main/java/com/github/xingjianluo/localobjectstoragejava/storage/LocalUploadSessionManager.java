@@ -74,6 +74,17 @@ public class LocalUploadSessionManager implements UploadSessionManager {
     private void loadAll() throws IOException {
         try (var stream = Files.list(sessionsDir)) {
             for (Path dir : stream.filter(Files::isDirectory).toList()) {
+                // 清理分片/元数据写入中断遗留的临时文件（upload-*.part、session.json.tmp）
+                try (var files = Files.list(dir)) {
+                    for (Path f : files.toList()) {
+                        String name = f.getFileName().toString();
+                        if ((name.startsWith("upload-") && name.endsWith(".part"))
+                                || name.equals("session.json.tmp")) {
+                            deleteQuietly(f);
+                            log.info("启动清理会话临时文件: {}", f);
+                        }
+                    }
+                }
                 Path metaFile = dir.resolve("session.json");
                 if (Files.exists(metaFile)) {
                     SessionMeta meta = mapper.readValue(metaFile.toFile(), SessionMeta.class);
