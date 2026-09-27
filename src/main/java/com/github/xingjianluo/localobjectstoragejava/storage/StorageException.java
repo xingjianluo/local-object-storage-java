@@ -17,7 +17,9 @@ public class StorageException extends RuntimeException {
         OBJECT_NOT_FOUND,
         VERSION_NOT_FOUND,
         CONTENT_MISSING,
-        STORAGE_CORRUPT
+        STORAGE_CORRUPT,
+        INVALID_RANGE,
+        RANGE_NOT_SATISFIABLE
     }
 
     private final ErrorCode code;

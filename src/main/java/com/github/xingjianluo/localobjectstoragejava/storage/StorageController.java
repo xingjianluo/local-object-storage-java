@@ -1,6 +1,7 @@
 package com.github.xingjianluo.localobjectstoragejava.storage;
 
 import jakarta.servlet.http.HttpServletRequest;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.DeleteMapping;
@@ -10,9 +11,11 @@ import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -80,19 +83,94 @@ public class StorageController {
     }
 
     @GetMapping("/objects/{objectKey}/data")
-    public ResponseEntity<byte[]> readLatest(@PathVariable String objectKey) throws IOException {
-        ObjectStorageService.ObjectData data = objectStorageService.readLatest(objectKey);
-        try (InputStream in = data.stream()) {
-            return ResponseEntity.ok(in.readAllBytes());
+    public ResponseEntity<StreamingResponseBody> readLatest(
+            @PathVariable String objectKey,
+            @RequestHeader(value = "Range", required = false) String range) {
+        if (range != null) {
+            return rangeResponse(range, (start, end) ->
+                    objectStorageService.readRangeLatest(objectKey, start, end));
         }
+        ObjectStorageService.ObjectData data = objectStorageService.readLatest(objectKey);
+        return fullResponse(data);
     }
 
     @GetMapping("/objects/{objectKey}/versions/{versionId}/data")
-    public ResponseEntity<byte[]> readVersion(@PathVariable String objectKey,
-                                              @PathVariable String versionId) throws IOException {
+    public ResponseEntity<StreamingResponseBody> readVersion(
+            @PathVariable String objectKey,
+            @PathVariable String versionId,
+            @RequestHeader(value = "Range", required = false) String range) {
+        if (range != null) {
+            return rangeResponse(range, (start, end) ->
+                    objectStorageService.readRangeVersion(objectKey, versionId, start, end));
+        }
         ObjectStorageService.ObjectData data = objectStorageService.readVersion(objectKey, versionId);
-        try (InputStream in = data.stream()) {
-            return ResponseEntity.ok(in.readAllBytes());
+        return fullResponse(data);
+    }
+
+    @FunctionalInterface
+    private interface RangeReader {
+        ObjectStorageService.RangeData read(long start, long end);
+    }
+
+    /** 整包流式响应：不在内存中缓冲对象内容。 */
+    private static ResponseEntity<StreamingResponseBody> fullResponse(
+            ObjectStorageService.ObjectData data) {
+        StreamingResponseBody body = out -> {
+            try (InputStream in = data.stream()) {
+                in.transferTo(out);
+            }
+        };
+        return ResponseEntity.ok()
+                .contentLength(data.version().size())
+                .header(HttpHeaders.ACCEPT_RANGES, "bytes")
+                .header("X-Object-Total-Size", Long.toString(data.version().size()))
+                .body(body);
+    }
+
+    /**
+     * 范围流式响应：206 + Content-Range，并通过 X-* 头明确给出
+     * 总长度、实际区间与是否还有后续数据。
+     */
+    private static ResponseEntity<StreamingResponseBody> rangeResponse(String rangeHeader,
+                                                                       RangeReader reader) {
+        long[] bounds = parseRangeHeader(rangeHeader);
+        ObjectStorageService.RangeData data = reader.read(bounds[0], bounds[1]);
+        StreamingResponseBody body = out -> {
+            try (InputStream in = data.stream()) {
+                in.transferTo(out);
+            }
+        };
+        return ResponseEntity.status(HttpStatus.PARTIAL_CONTENT)
+                .contentLength(data.rangeLength())
+                .header(HttpHeaders.ACCEPT_RANGES, "bytes")
+                .header(HttpHeaders.CONTENT_RANGE,
+                        "bytes " + data.rangeStart() + "-" + data.rangeEnd() + "/" + data.totalSize())
+                .header("X-Object-Total-Size", Long.toString(data.totalSize()))
+                .header("X-Range-Start", Long.toString(data.rangeStart()))
+                .header("X-Range-End", Long.toString(data.rangeEnd()))
+                .header("X-Has-More", Boolean.toString(data.hasMore()))
+                .body(body);
+    }
+
+    /** 解析 {@code Range: bytes=start-end} / {@code bytes=start-}，其余形式明确拒绝。 */
+    private static long[] parseRangeHeader(String header) {
+        StorageException invalid = new StorageException(StorageException.ErrorCode.INVALID_RANGE,
+                "无法解析的 Range 头: " + header + "（仅支持 bytes=start-end 或 bytes=start-）");
+        if (!header.startsWith("bytes=")) {
+            throw invalid;
+        }
+        String spec = header.substring("bytes=".length()).trim();
+        int dash = spec.indexOf('-');
+        if (dash <= 0 || dash != spec.lastIndexOf('-')) {
+            throw invalid;
+        }
+        try {
+            long start = Long.parseLong(spec.substring(0, dash).trim());
+            String endPart = spec.substring(dash + 1).trim();
+            long end = endPart.isEmpty() ? Long.MAX_VALUE : Long.parseLong(endPart);
+            return new long[]{start, end};
+        } catch (NumberFormatException e) {
+            throw invalid;
         }
     }
 
@@ -118,6 +196,7 @@ public class StorageController {
                     HttpStatus.NOT_FOUND;
             case SESSION_EXPIRED, SESSION_ALREADY_COMPLETED, SESSION_ALREADY_ABORTED ->
                     HttpStatus.CONFLICT;
+            case RANGE_NOT_SATISFIABLE -> HttpStatus.REQUESTED_RANGE_NOT_SATISFIABLE;
             default -> HttpStatus.BAD_REQUEST;
         };
         return ResponseEntity.status(status)

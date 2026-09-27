@@ -6,6 +6,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -162,6 +163,114 @@ public class LocalObjectStorageService implements ObjectStorageService {
         }
     }
 
+    @Override
+    public RangeData readRangeLatest(String objectKey, long start, long end) {
+        synchronized (lockOf(objectKey)) {
+            ObjectMeta meta = metas.get(objectKey);
+            if (meta == null || meta.versions.isEmpty()) {
+                throw new StorageException(StorageException.ErrorCode.OBJECT_NOT_FOUND,
+                        "对象不存在: " + objectKey);
+            }
+            VersionEntry latest = meta.versions.get(meta.versions.size() - 1);
+            return openRange(objectKey, latest, start, end);
+        }
+    }
+
+    @Override
+    public RangeData readRangeVersion(String objectKey, String versionId, long start, long end) {
+        synchronized (lockOf(objectKey)) {
+            return openRange(objectKey, findEntry(objectKey, versionId), start, end);
+        }
+    }
+
+    /**
+     * 在对象锁内调用：校验范围、打开内容流（加读钉）、跳过前缀并限制长度。
+     * 打开失败会释放读钉，因此不会泄漏钉住的内容。
+     */
+    private RangeData openRange(String objectKey, VersionEntry entry, long start, long end) {
+        if (start < 0 || end < start) {
+            throw new StorageException(StorageException.ErrorCode.INVALID_RANGE,
+                    "非法范围: start=" + start + ", end=" + end);
+        }
+        long size = entry.size;
+        if (start >= size) {
+            throw new StorageException(StorageException.ErrorCode.RANGE_NOT_SATISFIABLE,
+                    "起始偏移 " + start + " 超出对象长度 " + size
+                            + ": " + objectKey + "@" + entry.versionId);
+        }
+        long actualEnd = Math.min(end, size - 1);
+        InputStream raw = contentStore.open(entry.contentId);
+        try {
+            skipFully(raw, start);
+            InputStream bounded = new BoundedInputStream(raw, actualEnd - start + 1);
+            return new RangeData(toInfo(objectKey, entry), size, start, actualEnd,
+                    actualEnd < size - 1, bounded);
+        } catch (IOException | RuntimeException e) {
+            try {
+                raw.close();
+            } catch (IOException closeError) {
+                e.addSuppressed(closeError);
+            }
+            throw e instanceof RuntimeException re ? re : new UncheckedIOException((IOException) e);
+        }
+    }
+
+    private static void skipFully(InputStream in, long bytes) throws IOException {
+        long remaining = bytes;
+        while (remaining > 0) {
+            long skipped = in.skip(remaining);
+            if (skipped <= 0) {
+                if (in.read() == -1) {
+                    throw new StorageException(StorageException.ErrorCode.STORAGE_CORRUPT,
+                            "内容流提前结束，无法跳过 " + bytes + " 字节");
+                }
+                skipped = 1;
+            }
+            remaining -= skipped;
+        }
+    }
+
+    /** 只暴露前 {@code limit} 字节的流；关闭时会关闭底层流（从而释放读钉）。 */
+    private static final class BoundedInputStream extends java.io.FilterInputStream {
+        private long remaining;
+
+        BoundedInputStream(InputStream in, long limit) {
+            super(in);
+            this.remaining = limit;
+        }
+
+        @Override
+        public int read() throws IOException {
+            if (remaining <= 0) {
+                return -1;
+            }
+            int b = super.read();
+            if (b != -1) {
+                remaining--;
+            }
+            return b;
+        }
+
+        @Override
+        public int read(byte[] b, int off, int len) throws IOException {
+            if (remaining <= 0) {
+                return -1;
+            }
+            int n = super.read(b, off, (int) Math.min(len, remaining));
+            if (n > 0) {
+                remaining -= n;
+            }
+            return n;
+        }
+
+        @Override
+        public long skip(long n) throws IOException {
+            long skipped = super.skip(Math.min(n, remaining));
+            remaining -= skipped;
+            return skipped;
+        }
+    }
+
     private VersionEntry findEntry(String objectKey, String versionId) {
         ObjectMeta meta = metas.get(objectKey);
         if (meta == null) {
@@ -227,6 +336,19 @@ public class LocalObjectStorageService implements ObjectStorageService {
             log.info("删除对象 object={} 共 {} 个版本", objectKey, contentsToRelease.size());
         }
         contentsToRelease.forEach(contentStore::release);
+    }
+
+    @Override
+    public java.util.Map<String, Integer> contentReferences() {
+        java.util.Map<String, Integer> refs = new java.util.HashMap<>();
+        for (ObjectMeta meta : metas.values()) {
+            synchronized (lockOf(meta.objectKey)) {
+                for (VersionEntry e : meta.versions) {
+                    refs.merge(e.contentId, 1, Integer::sum);
+                }
+            }
+        }
+        return refs;
     }
 
     @Override

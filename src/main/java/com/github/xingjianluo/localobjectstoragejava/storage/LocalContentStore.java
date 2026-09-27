@@ -16,8 +16,10 @@ import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HexFormat;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -243,6 +245,69 @@ public class LocalContentStore implements ContentStore {
             }
         }
         return removed;
+    }
+
+    @Override
+    public ReconcileReport reconcile(Map<String, Integer> expectedRefs) {
+        List<String> corrected = new ArrayList<>();
+        List<String> missing = new ArrayList<>();
+        // 1. 以版本链元数据为准，修正引用计数漂移（崩溃可能发生在 retain/release 与落盘之间）
+        for (Map.Entry<String, Integer> e : expectedRefs.entrySet()) {
+            String contentId = e.getKey();
+            int expected = e.getValue();
+            synchronized (lockOf(contentId)) {
+                if (!Files.exists(blobPath(contentId))) {
+                    missing.add(contentId);
+                    log.error("对账发现元数据引用的内容缺失 contentId={} 应有引用={}",
+                            contentId, expected);
+                    continue;
+                }
+                Integer current = refCounts.get(contentId);
+                if (current == null || current != expected) {
+                    refCounts.put(contentId, expected);
+                    persistRefCount(contentId, expected);
+                    corrected.add(contentId);
+                    log.info("对账修正引用计数 contentId={} {} -> {}", contentId, current, expected);
+                }
+            }
+        }
+        // 2. 删除不被任何版本引用的残留（崩溃遗留在 put 之后、版本提交之前的内容等）
+        Set<String> orphans = new LinkedHashSet<>();
+        try (var stream = Files.list(blobDir)) {
+            for (Path p : stream.toList()) {
+                String name = p.getFileName().toString();
+                String contentId = name.endsWith(".ref")
+                        ? name.substring(0, name.length() - ".ref".length()) : name;
+                if (expectedRefs.containsKey(contentId)) {
+                    continue;
+                }
+                synchronized (lockOf(contentId)) {
+                    boolean pinned = pins.getOrDefault(contentId, 0) > 0;
+                    if (!expectedRefs.containsKey(contentId) && !pinned) {
+                        deleteQuietly(blobPath(contentId));
+                        deleteQuietly(refPath(contentId));
+                        refCounts.remove(contentId);
+                        orphans.add(contentId);
+                    }
+                }
+            }
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+        // 3. 清理写入中断遗留的临时文件
+        int removedTmp = 0;
+        try (var stream = Files.list(tmpDir)) {
+            for (Path p : stream.toList()) {
+                deleteQuietly(p);
+                removedTmp++;
+            }
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+        List<String> removedOrphans = new ArrayList<>(orphans);
+        log.info("对账完成：修正引用 {} 个，删除残留 {} 个，缺失 {} 个，清理临时文件 {} 个",
+                corrected.size(), removedOrphans.size(), missing.size(), removedTmp);
+        return new ReconcileReport(removedOrphans, missing, corrected, removedTmp);
     }
 
     private static MessageDigest newDigest() {
