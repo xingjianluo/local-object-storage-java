@@ -63,7 +63,8 @@ tmp/                      写入中的临时文件
 | `PARTS_MISSING` | 完成时缺少分片 | 400 |
 | `OBJECT_NOT_FOUND` / `VERSION_NOT_FOUND` | 对象/版本不存在 | 404 |
 | `CONTENT_MISSING` | 底层内容缺失或已回收 | 404 |
-| `RANGE_NOT_SATISFIABLE` | 范围非法（负偏移、非正长度）或起始位置超出对象长度 | 416 |
+| `INVALID_RANGE` | 范围写法非法（负偏移、零/负长度、起止颠倒、Range 头无法识别） | 400 |
+| `RANGE_NOT_SATISFIABLE` | 范围写法合法，但起始位置达到/超过对象长度（含空对象） | 416 |
 | `STORAGE_CORRUPT` | 内部一致性错误（如引用计数为负） | 400 |
 
 ## 范围读取（Range Read）
@@ -88,21 +89,36 @@ Range: bytes=-500       # 最后 500 字节
 
 | 响应头 | 含义 |
 |---|---|
-| `Content-Range: bytes <start>-<end>/<total>` | 本次实际返回的区间与对象总长度 |
+| `Content-Range: bytes <start>-<end>/<total>` | 本次实际返回的区间与对象总长度（标准头） |
 | `Content-Length` | 本次返回的字节数（`end - start + 1`） |
 | `Accept-Ranges: bytes` | 声明支持按段读取 |
+| `X-Object-Version-Id` | 本次读取命中的版本标识（最新版本或历史版本） |
+| `X-Object-Total-Size` | 对象总长度，客户端无需另发请求查询 |
+| `X-Object-Offset` | 本次实际返回区间的起始偏移 |
+| `X-Object-Length` | 本次实际返回的字节数（请求超长时为截断后的值） |
+| `X-Object-Has-More` | 本次区间之后是否还有数据（`true`/`false`） |
 
-客户端据此可边下边续：`total` 给出对象总长度，`Content-Range` 给出本次实际区间，
-当 `end + 1 < total` 时说明后面还有数据，可继续发下一段请求（断点续传/视频拖动）。
+`200` 整包响应同样携带这组 `X-Object-*` 头（此时 `Offset=0`、`Length=Total-Size`、
+`Has-More=false`），因此客户端可以用**完全相同的字段**处理整包与按段、最新版本与
+历史版本，不需要自行解析 `Content-Range` 或拿总长度推算。
 
 服务层 `ObjectStorageService.readLatestRange / readVersionRange` 返回的 `RangeData`
-同样携带 `totalSize / offset / length / hasMore`，语义与上述响应头一一对应；
-请求长度超出对象末尾时自动截断到末尾（不视为错误）。
+携带 `version / totalSize / offset / length / hasMore / stream`，与上述响应头一一对应；
+整包结果 `ObjectData` 也提供同名的 `totalSize() / offset() / length() / hasMore()`
+（整包即区间 `[0, size)`，`hasMore=false`），语义与按段完全一致。
+请求长度超出对象末尾时自动截断到末尾（`length` 为实际长度，不视为错误）。
 
-**拒绝规则**（`RANGE_NOT_SATISFIABLE`，HTTP 416，与对象/版本不存在的 404 明确区分）：
+### 范围读取的失败分类（三类稳定、可区分的返回）
 
-- 负偏移、零或负长度、`end < start`、无法识别的 Range 格式；
-- 起始位置 ≥ 对象长度（空对象的任何范围也因此被拒绝）。
+| 情况 | errorCode | HTTP | 客户端建议 |
+|---|---|---|---|
+| 范围写法错误：负偏移、零/负长度、`end < start`（起止颠倒）、Range 头格式无法识别、多区间 | `INVALID_RANGE` | 400 | 参数错误，修正前不要原样重试 |
+| 范围写法合法，但起始位置 ≥ 对象长度（空对象的任何范围、`bytes=<size>-` 均同此） | `RANGE_NOT_SATISFIABLE` | 416 | 对象可能增长，之后可重试；响应语义同 RFC 7233 |
+| 对象不存在 / 版本不存在 / 底层内容缺失 | `OBJECT_NOT_FOUND` / `VERSION_NOT_FOUND` / `CONTENT_MISSING` | 404 | 与范围类失败明确区分 |
+
+错误响应体统一为 `{"errorCode": "...", "message": "..."}`。分类规则在最新版本与任意
+历史版本、HTTP 层与服务层保持一致；判定顺序为先查对象/版本（404），再判负偏移（400），
+再判起点是否越界（416），最后判起点合法时的零/负长度（400）。
 
 **内存约束**：整包与按段下载均为流式输出（定界 `InputStream` + `StreamingResponseBody`），
 堆占用是固定的小缓冲区，与对象大小无关——几百 MB 的对象连续读取也不会顶高堆
@@ -121,12 +137,19 @@ Range: bytes=-500       # 最后 500 字节
 ## 并发与回收语义
 
 - 每个对象、每个会话、每个内容各有一把锁；并发上传相同内容只会落盘一份（去重命中日志可查）。
-- **读钉（pin）机制**：读取流（整包与范围读取共用）打开前对内容加钉，关闭时释放；
-  回收线程只删除 `refCount == 0 且无读钉` 的内容。因此读取与删除/回滚/回收交错时，
-  **要么得到完整一致的一段数据，要么以 `CONTENT_MISSING`/`OBJECT_NOT_FOUND` 等明确失败，
-  绝不返回半截或拼接错位的内容**（有交错单测覆盖）。
-- 范围读取在对象锁内解析版本并打开定界流，版本解析与内容加钉是原子的，
-  不会读到“版本 A 的长度 + 版本 B 的内容”这类错位组合。
+- **读取与删除/回滚/回收同时发生时的约定**：读取（整包或按段、最新或历史版本）
+  **要么返回完整一致的一段并给出与内容严格对应的元信息（totalSize/offset/length/hasMore），
+  要么以明确的错误码失败（`OBJECT_NOT_FOUND`/`VERSION_NOT_FOUND`/`CONTENT_MISSING`），
+  绝不返回半截数据、拼接数据或“版本 A 的长度 + 版本 B 的内容”这类前后对不上的结果。**
+- **读钉（pin）机制**：读取流打开前对内容加钉，关闭时释放；回收线程只删除
+  `refCount == 0 且无读钉` 的内容。因此删除版本/对象（先落元数据再 `release`）与
+  回收（`sweep`）交错时，已经打开的读取流一定能读完整个区间；流关闭后内容才可能被回收。
+- **按段读取的原子性**：范围读取在对象锁内一次性完成“定位版本 → 校验范围 → 内容加钉
+  → 打开定界流”，区间长度与内容来自同一版本，不会读到错位组合。
+- **回滚进行中的按段读取**：回滚（取历史版本 → retain → 追加新版本并落元数据）在同一把
+  对象锁内原子完成，按段读取在锁上排队，因此只会观察到“回滚前的最新版本”或
+  “回滚后的新版本”二者之一，不会观察到回滚的中间状态；回滚目标版本恰好在并发中被删时，
+  回滚与读取都收到明确的 404 类失败。
 - 分片与元数据全部通过“临时文件 + 原子 rename”落盘，任何中断（进程崩溃、异常）
   都不会留下可见的半成品对象；未完成/中止/过期的上传不产生可见对象。
 - `StorageGarbageCollector` 按 `local-storage.gc-interval` 周期回收过期会话与不可达内容。
@@ -160,9 +183,14 @@ Range: bytes=-500       # 最后 500 字节
 ## 本地验证
 
 ```bash
-# 运行全部测试（29 个：乱序/重复分片、校验失败、过期、并发、删除回滚交错、
-# 范围读取边界与非法范围、边读边删/边回收、大对象内存上界、崩溃重启对账、GC 等）
+# 运行全部测试（38 个：乱序/重复分片、校验失败、过期、并发、删除回滚交错、
+# 范围读取开头/结尾/跨分片边界/单字节/空对象/各类非法范围、
+# 按段读取+删除+回滚+回收真实交错、回滚进行中按段读取、
+# HTTP 层 400/416/404 区分与 X-Object-* 响应头、大对象内存上界、崩溃重启对账、GC 等）
 mvn test
+
+# 只跑范围相关测试（服务层 + HTTP 层）
+mvn test -Dtest='RangeReadTest,RangeReadHttpTest'
 
 # 启动服务
 mvn spring-boot:run
@@ -177,13 +205,20 @@ printf 'hello-' | curl -s -X PUT "localhost:8080/api/storage/sessions/$SID/parts
   -H 'Content-Type: application/octet-stream' --data-binary @-
 curl -s -X POST localhost:8080/api/storage/sessions/$SID/complete
 
-# 整包下载（流式，200）
-curl -s localhost:8080/api/storage/objects/demo.txt/data
+# 整包下载（200，X-Object-* 头：Offset=0、Length=Total-Size、Has-More=false）
+curl -s -D- localhost:8080/api/storage/objects/demo.txt/data
 
-# 范围下载（206，带 Content-Range）
+# 范围下载（206，Content-Range + X-Object-Total-Size/Offset/Length/Has-More）
 curl -s -D- -H 'Range: bytes=1-3' localhost:8080/api/storage/objects/demo.txt/data
-# 非法范围 / 起点越界（416）
+
+# 起点越界：416 + errorCode=RANGE_NOT_SATISFIABLE（范围写法本身合法，对象增长后可重试）
 curl -s -D- -H 'Range: bytes=100-200' localhost:8080/api/storage/objects/demo.txt/data
+
+# 起止颠倒：400 + errorCode=INVALID_RANGE（写法错误，不应原样重试）
+curl -s -D- -H 'Range: bytes=5-2' localhost:8080/api/storage/objects/demo.txt/data
+
+# 对象不存在即使带 Range 也仍是 404 + OBJECT_NOT_FOUND
+curl -s -D- -H 'Range: bytes=0-1' localhost:8080/api/storage/objects/missing/data
 ```
 
 单测日志（`log.info`）会打印上传会话 ID、分片编号、sha256 校验依据、

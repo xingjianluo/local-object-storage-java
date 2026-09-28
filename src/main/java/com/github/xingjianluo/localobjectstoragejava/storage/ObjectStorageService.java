@@ -11,7 +11,27 @@ public interface ObjectStorageService {
     record VersionInfo(String versionId, String objectKey, String contentId,
                        long size, long createdAtEpochMillis, boolean deleted) {}
 
-    record ObjectData(VersionInfo version, InputStream stream) {}
+    /**
+     * 整包读取结果。{@code totalSize/offset/length/hasMore} 与 {@link RangeData} 同语义：
+     * 整包即区间 [0, size)，故 offset=0、length=totalSize、hasMore=false。
+     */
+    record ObjectData(VersionInfo version, InputStream stream) {
+        public long totalSize() {
+            return version.size();
+        }
+
+        public long offset() {
+            return 0L;
+        }
+
+        public long length() {
+            return version.size();
+        }
+
+        public boolean hasMore() {
+            return false;
+        }
+    }
 
     /**
      * 范围读取结果：totalSize 为对象总长度，[offset, offset+length) 为本次实际返回的区间，
@@ -31,7 +51,9 @@ public interface ObjectStorageService {
 
     /**
      * 按字节范围读取最新版本：[offset, offset+length)，超出末尾的部分自动截断。
-     * 范围非法（负偏移、非正长度）或起始位置超出对象长度时抛出 RANGE_NOT_SATISFIABLE。
+     * 判定顺序：对象/版本不存在分别抛 OBJECT_NOT_FOUND / VERSION_NOT_FOUND；
+     * 负偏移抛 INVALID_RANGE；起点达到/超过对象长度（含空对象）抛 RANGE_NOT_SATISFIABLE；
+     * 起点合法但长度非正抛 INVALID_RANGE。
      */
     RangeData readLatestRange(String objectKey, long offset, long length);
 

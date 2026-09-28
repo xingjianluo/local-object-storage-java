@@ -117,8 +117,10 @@ public class StorageController {
         };
         return ResponseEntity.ok()
                 .contentType(MediaType.APPLICATION_OCTET_STREAM)
-                .contentLength(data.version().size())
+                .contentLength(data.length())
                 .header(HttpHeaders.ACCEPT_RANGES, "bytes")
+                .headers(headers -> segmentHeaders(headers, data.version().versionId(),
+                        data.totalSize(), data.offset(), data.length(), data.hasMore()))
                 .body(body);
     }
 
@@ -136,30 +138,49 @@ public class StorageController {
                 .header(HttpHeaders.ACCEPT_RANGES, "bytes")
                 .header(HttpHeaders.CONTENT_RANGE,
                         "bytes " + data.offset() + "-" + end + "/" + data.totalSize())
+                .headers(headers -> segmentHeaders(headers, data.version().versionId(),
+                        data.totalSize(), data.offset(), data.length(), data.hasMore()))
                 .body(body);
     }
 
     /**
-     * 解析 {@code Range: bytes=start-end | bytes=start- | bytes=-suffix}，
-     * 返回 {offset, length}；格式非法时抛 RANGE_NOT_SATISFIABLE（映射为 416）。
+     * 整包（200）与按段（206）共用的分段元信息响应头，客户端无需用
+     * Content-Range 自行推算：对象总长度、本次区间起止、是否还有后续数据一目了然。
+     */
+    private static void segmentHeaders(HttpHeaders headers, String versionId,
+                                       long totalSize, long offset, long length, boolean hasMore) {
+        headers.add("X-Object-Version-Id", versionId);
+        headers.add("X-Object-Total-Size", Long.toString(totalSize));
+        headers.add("X-Object-Offset", Long.toString(offset));
+        headers.add("X-Object-Length", Long.toString(length));
+        headers.add("X-Object-Has-More", Boolean.toString(hasMore));
+    }
+
+    /**
+     * 解析 {@code Range: bytes=start-end | bytes=start- | bytes=-suffix}，返回 {offset, length}。
+     *
+     * <p>本方法只做语法/写法校验，以下情况抛 {@code INVALID_RANGE}（HTTP 400）：
+     * 无法识别的格式、多区间、起止颠倒（end &lt; start）、负数、零长度后缀；
+     * 而“写法合法但起点达到/超过对象长度”不在此拒绝（如 {@code bytes=100-}），
+     * 由服务层统一抛 {@code RANGE_NOT_SATISFIABLE}（HTTP 416），两类失败稳定可区分。</p>
      */
     public static long[] parseRangeHeader(String header, long totalSize) {
         String h = header.trim();
         if (!h.regionMatches(true, 0, "bytes=", 0, "bytes=".length())) {
-            throw new StorageException(StorageException.ErrorCode.RANGE_NOT_SATISFIABLE,
+            throw new StorageException(StorageException.ErrorCode.INVALID_RANGE,
                     "无法识别的 Range 头: " + header);
         }
         String spec = h.substring("bytes=".length()).trim();
         int dash = spec.indexOf('-');
         if (dash < 0 || spec.indexOf(',', 0) >= 0) {
-            throw new StorageException(StorageException.ErrorCode.RANGE_NOT_SATISFIABLE,
-                    "无法识别的 Range 头: " + header);
+            throw new StorageException(StorageException.ErrorCode.INVALID_RANGE,
+                    "无法识别的 Range 头（仅支持单段范围）: " + header);
         }
         String startPart = spec.substring(0, dash).trim();
         String endPart = spec.substring(dash + 1).trim();
         try {
             if (startPart.isEmpty()) {
-                // 后缀范围：最后 N 字节
+                // 后缀范围：最后 N 字节；N<=0 属于写法错误
                 long suffix = Long.parseLong(endPart);
                 if (suffix <= 0) {
                     throw new NumberFormatException("suffix <= 0");
@@ -168,15 +189,21 @@ public class StorageController {
                 return new long[]{offset, totalSize - offset};
             }
             long start = Long.parseLong(startPart);
-            long length = endPart.isEmpty()
-                    ? totalSize - start
-                    : Long.parseLong(endPart) - start + 1;
-            if (start < 0 || (!endPart.isEmpty() && length <= 0)) {
-                throw new NumberFormatException("invalid range bounds");
+            if (start < 0) {
+                throw new NumberFormatException("negative start");
             }
-            return new long[]{start, length};
+            if (endPart.isEmpty()) {
+                // bytes=start-：长度交给服务层按对象长度判定（start>=total 时为 416）
+                return new long[]{start, totalSize - start};
+            }
+            long end = Long.parseLong(endPart);
+            if (end < start) {
+                // 起止颠倒：范围写法本身错误，与对象长度无关
+                throw new NumberFormatException("end < start");
+            }
+            return new long[]{start, end - start + 1};
         } catch (NumberFormatException e) {
-            throw new StorageException(StorageException.ErrorCode.RANGE_NOT_SATISFIABLE,
+            throw new StorageException(StorageException.ErrorCode.INVALID_RANGE,
                     "无法识别的 Range 头: " + header);
         }
     }
@@ -203,6 +230,7 @@ public class StorageController {
                     HttpStatus.NOT_FOUND;
             case SESSION_EXPIRED, SESSION_ALREADY_COMPLETED, SESSION_ALREADY_ABORTED ->
                     HttpStatus.CONFLICT;
+            case INVALID_RANGE -> HttpStatus.BAD_REQUEST;
             case RANGE_NOT_SATISFIABLE -> HttpStatus.REQUESTED_RANGE_NOT_SATISFIABLE;
             default -> HttpStatus.BAD_REQUEST;
         };

@@ -17,6 +17,9 @@ public class StorageException extends RuntimeException {
         OBJECT_NOT_FOUND,
         VERSION_NOT_FOUND,
         CONTENT_MISSING,
+        /** 范围参数本身非法（负偏移、零/负长度、起止颠倒、Range 头格式无法识别），不应原样重试。 */
+        INVALID_RANGE,
+        /** 范围写法合法，但起始位置已达到或超过对象长度（空对象的任何范围同此）；对象增长后可能变得可满足。 */
         RANGE_NOT_SATISFIABLE,
         STORAGE_CORRUPT
     }

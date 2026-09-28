@@ -129,18 +129,23 @@ public class LocalObjectStorageService implements ObjectStorageService {
         // 先 retain：保证元数据引用内容时引用计数已 +1
         contentStore.retain(contentId);
         synchronized (lockOf(objectKey)) {
-            ObjectMeta meta = metas.computeIfAbsent(objectKey, k -> {
-                ObjectMeta m = new ObjectMeta();
-                m.objectKey = k;
-                return m;
-            });
-            String versionId = UUID.randomUUID().toString();
-            meta.versions.add(new VersionEntry(versionId, contentId, size, System.currentTimeMillis()));
-            persistMeta(meta);
-            log.info("提交新版本 object={} versionId={} contentId={} size={}",
-                    objectKey, versionId, contentId, size);
-            return versionId;
+            return commitVersionLocked(objectKey, contentId, size);
         }
+    }
+
+    /** 在对象锁内调用：追加并持久化一个新版本（调用方需已完成 retain）。 */
+    private String commitVersionLocked(String objectKey, String contentId, long size) {
+        ObjectMeta meta = metas.computeIfAbsent(objectKey, k -> {
+            ObjectMeta m = new ObjectMeta();
+            m.objectKey = k;
+            return m;
+        });
+        String versionId = UUID.randomUUID().toString();
+        meta.versions.add(new VersionEntry(versionId, contentId, size, System.currentTimeMillis()));
+        persistMeta(meta);
+        log.info("提交新版本 object={} versionId={} contentId={} size={}",
+                objectKey, versionId, contentId, size);
+        return versionId;
     }
 
     @Override
@@ -187,13 +192,22 @@ public class LocalObjectStorageService implements ObjectStorageService {
 
     /** 在对象锁内调用：校验范围并打开定界读取流。 */
     private RangeData openRange(String objectKey, VersionEntry entry, long offset, long length) {
-        if (offset < 0 || length <= 0) {
-            throw new StorageException(StorageException.ErrorCode.RANGE_NOT_SATISFIABLE,
+        // 负偏移：范围写法本身错误，与对象长度无关
+        if (offset < 0) {
+            throw new StorageException(StorageException.ErrorCode.INVALID_RANGE,
                     "非法范围: offset=" + offset + " length=" + length);
         }
+        // 范围写法合法，但起点已经达到/超过对象长度（空对象的任何范围、bytes=<size>- 均在此被拒绝）：
+        // 对象增长后该范围可能变得可满足。先于长度判定，保证“起点越界”稳定归类为 416。
         if (offset >= entry.size) {
             throw new StorageException(StorageException.ErrorCode.RANGE_NOT_SATISFIABLE,
                     "起始位置 " + offset + " 超出对象长度 " + entry.size);
+        }
+        // 起点合法但长度非正：写法问题（零长度/负长度，或 bytes=start- 的 start 恰好等于长度的情形
+        // 已在上一条件归为 416，能走到这里的都是调用方显式传入的非正长度）
+        if (length <= 0) {
+            throw new StorageException(StorageException.ErrorCode.INVALID_RANGE,
+                    "非法范围: offset=" + offset + " length=" + length);
         }
         long actualLength = Math.min(length, entry.size - offset);
         boolean hasMore = offset + actualLength < entry.size;
@@ -302,16 +316,22 @@ public class LocalObjectStorageService implements ObjectStorageService {
 
     @Override
     public String rollback(String objectKey, String versionId) {
-        String contentId;
-        long size;
         synchronized (lockOf(objectKey)) {
+            // 取历史版本、retain、追加新版本在同一把对象锁内原子完成：
+            // 回滚进行期间按段读取要么看到回滚前的最新版本，要么看到回滚后的新版本，
+            // 不会观察到“版本已删、新版本未提交”的中间窗口。
             VersionEntry entry = findEntry(objectKey, versionId);
-            contentId = entry.contentId;
-            size = entry.size;
+            // retain 抛 CONTENT_MISSING 时元数据不变，调用方收到明确失败
+            contentStore.retain(entry.contentId);
+            String newVersionId;
+            try {
+                newVersionId = commitVersionLocked(objectKey, entry.contentId, entry.size);
+            } catch (RuntimeException e) {
+                contentStore.release(entry.contentId);
+                throw e;
+            }
+            log.info("回滚 object={} 到版本 {}，生成新版本 {}", objectKey, versionId, newVersionId);
+            return newVersionId;
         }
-        // commitVersion 内部会 retain 内容并追加新版本
-        String newVersionId = commitVersion(objectKey, contentId, size);
-        log.info("回滚 object={} 到版本 {}，生成新版本 {}", objectKey, versionId, newVersionId);
-        return newVersionId;
     }
 }
