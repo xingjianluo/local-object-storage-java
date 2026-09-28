@@ -196,18 +196,27 @@ public class LocalContentStore implements ContentStore {
         }
         try {
             InputStream raw = Files.newInputStream(blobPath(contentId));
+            // 关键：先用“全长”包装流再在其上 skip——skip 经过 {@link BoundedPinStream}
+            // 会同步扣减 remaining，保证定界计数与底层文件位置一致；
+            // 不能对裸流 skip（FileInputStream#skip 只推进内部 position，
+            // 包装层无从感知，会导致 remaining 偏大/提前 EOF 这类错位）。
+            BoundedPinStream bounded = new BoundedPinStream(raw, contentId,
+                    length == Long.MAX_VALUE ? Long.MAX_VALUE : offset + length);
             long toSkip = offset;
             while (toSkip > 0) {
-                long skipped = raw.skip(toSkip);
+                long skipped = bounded.skip(toSkip);
                 if (skipped <= 0) {
-                    if (raw.read() == -1) {
+                    if (bounded.read() == -1) {
+                        bounded.close();
                         throw new IOException("内容长度不足，无法定位到偏移 " + offset);
                     }
                     skipped = 1;
                 }
                 toSkip -= skipped;
             }
-            return new BoundedPinStream(raw, contentId, length);
+            // 定位完成后把可读上限重置为本次区间长度
+            bounded.remaining = length;
+            return bounded;
         } catch (IOException e) {
             unpin(contentId);
             throw new UncheckedIOException(e);

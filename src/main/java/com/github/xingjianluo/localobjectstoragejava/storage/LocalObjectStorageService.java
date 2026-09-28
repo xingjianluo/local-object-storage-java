@@ -144,7 +144,7 @@ public class LocalObjectStorageService implements ObjectStorageService {
     }
 
     @Override
-    public ObjectData readLatest(String objectKey) {
+    public RangeData readLatest(String objectKey) {
         synchronized (lockOf(objectKey)) {
             ObjectMeta meta = metas.get(objectKey);
             if (meta == null || meta.versions.isEmpty()) {
@@ -152,16 +152,22 @@ public class LocalObjectStorageService implements ObjectStorageService {
                         "对象不存在: " + objectKey);
             }
             VersionEntry latest = meta.versions.get(meta.versions.size() - 1);
-            return new ObjectData(toInfo(objectKey, latest), contentStore.open(latest.contentId));
+            // 整包与按段共用同一返回：整包即 [0, size)、hasMore=false
+            return openFull(objectKey, latest);
         }
     }
 
     @Override
-    public ObjectData readVersion(String objectKey, String versionId) {
+    public RangeData readVersion(String objectKey, String versionId) {
         synchronized (lockOf(objectKey)) {
-            VersionEntry entry = findEntry(objectKey, versionId);
-            return new ObjectData(toInfo(objectKey, entry), contentStore.open(entry.contentId));
+            return openFull(objectKey, findEntry(objectKey, versionId));
         }
+    }
+
+    /** 在对象锁内调用：打开整包读取流（offset=0, length=size, hasMore=false）。 */
+    private RangeData openFull(String objectKey, VersionEntry entry) {
+        return new RangeData(toInfo(objectKey, entry), entry.size, 0, entry.size,
+                false, contentStore.open(entry.contentId));
     }
 
     @Override
@@ -172,28 +178,63 @@ public class LocalObjectStorageService implements ObjectStorageService {
                 throw new StorageException(StorageException.ErrorCode.OBJECT_NOT_FOUND,
                         "对象不存在: " + objectKey);
             }
-            VersionEntry latest = meta.versions.get(meta.versions.size() - 1);
-            return openRange(objectKey, latest, offset, length);
+            return openNumericRange(objectKey, meta.versions.get(meta.versions.size() - 1),
+                    offset, length);
         }
     }
 
     @Override
     public RangeData readVersionRange(String objectKey, String versionId, long offset, long length) {
         synchronized (lockOf(objectKey)) {
-            VersionEntry entry = findEntry(objectKey, versionId);
-            return openRange(objectKey, entry, offset, length);
+            return openNumericRange(objectKey, findEntry(objectKey, versionId), offset, length);
         }
     }
 
-    /** 在对象锁内调用：校验范围并打开定界读取流。 */
-    private RangeData openRange(String objectKey, VersionEntry entry, long offset, long length) {
-        if (offset < 0 || length <= 0) {
-            throw new StorageException(StorageException.ErrorCode.RANGE_NOT_SATISFIABLE,
-                    "非法范围: offset=" + offset + " length=" + length);
+    @Override
+    public RangeData readLatestRange(String objectKey, ByteRange range) {
+        synchronized (lockOf(objectKey)) {
+            ObjectMeta meta = metas.get(objectKey);
+            if (meta == null || meta.versions.isEmpty()) {
+                throw new StorageException(StorageException.ErrorCode.OBJECT_NOT_FOUND,
+                        "对象不存在: " + objectKey);
+            }
+            return openSpecRange(objectKey, meta.versions.get(meta.versions.size() - 1), range);
         }
+    }
+
+    @Override
+    public RangeData readVersionRange(String objectKey, String versionId, ByteRange range) {
+        synchronized (lockOf(objectKey)) {
+            return openSpecRange(objectKey, findEntry(objectKey, versionId), range);
+        }
+    }
+
+    /** 在对象锁内调用：编程式 [offset, offset+length) 入参的写法校验与开流。 */
+    private RangeData openNumericRange(String objectKey, VersionEntry entry, long offset, long length) {
+        if (offset < 0 || length <= 0) {
+            throw new StorageException(StorageException.ErrorCode.INVALID_RANGE,
+                    "非法范围: offset=" + offset + " length=" + length
+                            + "（要求 offset>=0 且 length>0）");
+        }
+        return openResolved(objectKey, entry, new ByteRange.Resolved(offset, length));
+    }
+
+    /** 在对象锁内调用：把范围写法对照该版本长度解析并开流（起点越界抛 416 类错误）。 */
+    private RangeData openSpecRange(String objectKey, VersionEntry entry, ByteRange range) {
+        if (range == null) {
+            throw new StorageException(StorageException.ErrorCode.INVALID_RANGE, "范围为空");
+        }
+        // resolve 与 openRange 在同一对象锁内：版本长度与内容必定来自同一个版本
+        return openResolved(objectKey, entry, range.resolve(entry.size));
+    }
+
+    /** 在对象锁内调用：按已解析区间截断末尾、加钉并打开定界流。 */
+    private RangeData openResolved(String objectKey, VersionEntry entry, ByteRange.Resolved resolved) {
+        long offset = resolved.offset();
+        long length = resolved.length();
         if (offset >= entry.size) {
             throw new StorageException(StorageException.ErrorCode.RANGE_NOT_SATISFIABLE,
-                    "起始位置 " + offset + " 超出对象长度 " + entry.size);
+                    "起始位置 " + offset + " 已达到或超过对象长度 " + entry.size);
         }
         long actualLength = Math.min(length, entry.size - offset);
         boolean hasMore = offset + actualLength < entry.size;

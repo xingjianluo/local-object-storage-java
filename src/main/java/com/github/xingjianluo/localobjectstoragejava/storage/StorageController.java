@@ -83,14 +83,21 @@ public class StorageController {
         return objectStorageService.listVersions(objectKey);
     }
 
+    /** 整包/按段成功返回时，显式给出总长度、本次区间与后续是否还有数据（整包/按段一致）。 */
+    static final String H_TOTAL_SIZE = "X-Object-Total-Size";
+    static final String H_RANGE_OFFSET = "X-Range-Offset";
+    static final String H_RANGE_LENGTH = "X-Range-Length";
+    static final String H_HAS_MORE = "X-Has-More";
+
     @GetMapping("/objects/{objectKey}/data")
     public ResponseEntity<StreamingResponseBody> readLatest(
             @PathVariable String objectKey,
             @RequestHeader(value = "Range", required = false) String rangeHeader) {
         if (rangeHeader != null) {
-            ObjectStorageService.VersionInfo info = objectStorageService.statLatest(objectKey);
-            long[] range = parseRangeHeader(rangeHeader, info.size());
-            return rangeResponse(objectStorageService.readLatestRange(objectKey, range[0], range[1]));
+            // 先做“写法”校验（INVALID_RANGE/400），再在服务层对象锁内对照版本长度解析
+            // （RANGE_NOT_SATISFIABLE/416）：版本解析、长度判断与内容加钉是同一个原子步骤
+            ByteRange range = ByteRange.parseHttpHeader(rangeHeader);
+            return rangeResponse(objectStorageService.readLatestRange(objectKey, range));
         }
         return fullResponse(objectStorageService.readLatest(objectKey));
     }
@@ -101,15 +108,15 @@ public class StorageController {
             @PathVariable String versionId,
             @RequestHeader(value = "Range", required = false) String rangeHeader) {
         if (rangeHeader != null) {
-            ObjectStorageService.VersionInfo info = objectStorageService.statVersion(objectKey, versionId);
-            long[] range = parseRangeHeader(rangeHeader, info.size());
-            return rangeResponse(objectStorageService.readVersionRange(objectKey, versionId, range[0], range[1]));
+            ByteRange range = ByteRange.parseHttpHeader(rangeHeader);
+            return rangeResponse(
+                    objectStorageService.readVersionRange(objectKey, versionId, range));
         }
         return fullResponse(objectStorageService.readVersion(objectKey, versionId));
     }
 
-    /** 整包下载：流式写出，内存占用与对象大小无关。 */
-    private ResponseEntity<StreamingResponseBody> fullResponse(ObjectStorageService.ObjectData data) {
+    /** 整包下载：流式写出，内存占用与对象大小无关；响应头同样显式给出四字段。 */
+    private ResponseEntity<StreamingResponseBody> fullResponse(ObjectStorageService.RangeData data) {
         StreamingResponseBody body = out -> {
             try (InputStream in = data.stream()) {
                 in.transferTo(out);
@@ -117,12 +124,16 @@ public class StorageController {
         };
         return ResponseEntity.ok()
                 .contentType(MediaType.APPLICATION_OCTET_STREAM)
-                .contentLength(data.version().size())
+                .contentLength(data.length())
                 .header(HttpHeaders.ACCEPT_RANGES, "bytes")
+                .header(H_TOTAL_SIZE, Long.toString(data.totalSize()))
+                .header(H_RANGE_OFFSET, Long.toString(data.offset()))
+                .header(H_RANGE_LENGTH, Long.toString(data.length()))
+                .header(H_HAS_MORE, Boolean.toString(data.hasMore()))
                 .body(body);
     }
 
-    /** 范围下载：206 + Content-Range，流式写出。 */
+    /** 范围下载：206 + Content-Range，流式写出；另显式给出总长度、本次区间与 hasMore。 */
     private ResponseEntity<StreamingResponseBody> rangeResponse(ObjectStorageService.RangeData data) {
         StreamingResponseBody body = out -> {
             try (InputStream in = data.stream()) {
@@ -136,49 +147,11 @@ public class StorageController {
                 .header(HttpHeaders.ACCEPT_RANGES, "bytes")
                 .header(HttpHeaders.CONTENT_RANGE,
                         "bytes " + data.offset() + "-" + end + "/" + data.totalSize())
+                .header(H_TOTAL_SIZE, Long.toString(data.totalSize()))
+                .header(H_RANGE_OFFSET, Long.toString(data.offset()))
+                .header(H_RANGE_LENGTH, Long.toString(data.length()))
+                .header(H_HAS_MORE, Boolean.toString(data.hasMore()))
                 .body(body);
-    }
-
-    /**
-     * 解析 {@code Range: bytes=start-end | bytes=start- | bytes=-suffix}，
-     * 返回 {offset, length}；格式非法时抛 RANGE_NOT_SATISFIABLE（映射为 416）。
-     */
-    public static long[] parseRangeHeader(String header, long totalSize) {
-        String h = header.trim();
-        if (!h.regionMatches(true, 0, "bytes=", 0, "bytes=".length())) {
-            throw new StorageException(StorageException.ErrorCode.RANGE_NOT_SATISFIABLE,
-                    "无法识别的 Range 头: " + header);
-        }
-        String spec = h.substring("bytes=".length()).trim();
-        int dash = spec.indexOf('-');
-        if (dash < 0 || spec.indexOf(',', 0) >= 0) {
-            throw new StorageException(StorageException.ErrorCode.RANGE_NOT_SATISFIABLE,
-                    "无法识别的 Range 头: " + header);
-        }
-        String startPart = spec.substring(0, dash).trim();
-        String endPart = spec.substring(dash + 1).trim();
-        try {
-            if (startPart.isEmpty()) {
-                // 后缀范围：最后 N 字节
-                long suffix = Long.parseLong(endPart);
-                if (suffix <= 0) {
-                    throw new NumberFormatException("suffix <= 0");
-                }
-                long offset = Math.max(0, totalSize - suffix);
-                return new long[]{offset, totalSize - offset};
-            }
-            long start = Long.parseLong(startPart);
-            long length = endPart.isEmpty()
-                    ? totalSize - start
-                    : Long.parseLong(endPart) - start + 1;
-            if (start < 0 || (!endPart.isEmpty() && length <= 0)) {
-                throw new NumberFormatException("invalid range bounds");
-            }
-            return new long[]{start, length};
-        } catch (NumberFormatException e) {
-            throw new StorageException(StorageException.ErrorCode.RANGE_NOT_SATISFIABLE,
-                    "无法识别的 Range 头: " + header);
-        }
     }
 
     @DeleteMapping("/objects/{objectKey}/versions/{versionId}")
@@ -203,6 +176,7 @@ public class StorageController {
                     HttpStatus.NOT_FOUND;
             case SESSION_EXPIRED, SESSION_ALREADY_COMPLETED, SESSION_ALREADY_ABORTED ->
                     HttpStatus.CONFLICT;
+            case INVALID_RANGE -> HttpStatus.BAD_REQUEST;
             case RANGE_NOT_SATISFIABLE -> HttpStatus.REQUESTED_RANGE_NOT_SATISFIABLE;
             default -> HttpStatus.BAD_REQUEST;
         };

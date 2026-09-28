@@ -63,7 +63,8 @@ tmp/                      写入中的临时文件
 | `PARTS_MISSING` | 完成时缺少分片 | 400 |
 | `OBJECT_NOT_FOUND` / `VERSION_NOT_FOUND` | 对象/版本不存在 | 404 |
 | `CONTENT_MISSING` | 底层内容缺失或已回收 | 404 |
-| `RANGE_NOT_SATISFIABLE` | 范围非法（负偏移、非正长度）或起始位置超出对象长度 | 416 |
+| `INVALID_RANGE` | 范围写法本身非法（负偏移、零/负长度、起止颠倒、Range 头无法解析）——**客户端把范围写错/取错**，应修正请求后重试 | 400 |
+| `RANGE_NOT_SATISFIABLE` | 范围写法合法，但起始位置已达到/超过对象长度（空对象的任何范围同理）——**对象就这么长，重试也无济于事**，应向用户提示“已到末尾” | 416 |
 | `STORAGE_CORRUPT` | 内部一致性错误（如引用计数为负） | 400 |
 
 ## 范围读取（Range Read）
@@ -73,10 +74,9 @@ tmp/                      写入中的临时文件
 - `GET /api/storage/objects/{key}/data` —— 最新版本
 - `GET /api/storage/objects/{key}/versions/{versionId}/data` —— 任意历史版本
 
-**不带 `Range` 头**：返回 `200`，流式输出完整内容，响应头含
-`Content-Length`（对象总长度）与 `Accept-Ranges: bytes`（声明支持按段读取）。
+**不带 `Range` 头（整包）**：返回 `200`，流式输出完整内容。
 
-**带 `Range` 头**（RFC 7233 单段语法）：
+**带 `Range` 头（按段，RFC 7233 单段语法）**：
 
 ```
 Range: bytes=100-199    # 第 100~199 字节（闭区间）
@@ -84,25 +84,48 @@ Range: bytes=100-       # 第 100 字节到末尾
 Range: bytes=-500       # 最后 500 字节
 ```
 
-返回 `206 Partial Content`，响应头：
+写法合法时返回 `206 Partial Content`。
+
+### 成功返回里直接给出的字段（整包与按段、最新与历史版本语义一致）
+
+客户端**不需要自己拿总长度和结束位置推算**，200 与 206 响应都带以下四个头：
 
 | 响应头 | 含义 |
 |---|---|
-| `Content-Range: bytes <start>-<end>/<total>` | 本次实际返回的区间与对象总长度 |
-| `Content-Length` | 本次返回的字节数（`end - start + 1`） |
-| `Accept-Ranges: bytes` | 声明支持按段读取 |
+| `X-Object-Total-Size` | 对象（所读版本）的**总字节长度** |
+| `X-Range-Offset` | 本次实际返回区间的起始偏移（整包为 `0`） |
+| `X-Range-Length` | 本次实际返回的字节数（已对对象末尾做截断；整包=总长度） |
+| `X-Has-More` | 本次区间之后**是否还有数据**（`true`/`false`；整包与读到末尾时为 `false`） |
 
-客户端据此可边下边续：`total` 给出对象总长度，`Content-Range` 给出本次实际区间，
-当 `end + 1 < total` 时说明后面还有数据，可继续发下一段请求（断点续传/视频拖动）。
+按段响应另外带标准头：
 
-服务层 `ObjectStorageService.readLatestRange / readVersionRange` 返回的 `RangeData`
-同样携带 `totalSize / offset / length / hasMore`，语义与上述响应头一一对应；
-请求长度超出对象末尾时自动截断到末尾（不视为错误）。
+| 响应头 | 含义 |
+|---|---|
+| `Content-Range: bytes <start>-<end>/<total>` | 本次实际返回的闭区间与对象总长度 |
+| `Content-Length` | 本次返回的字节数（与 `X-Range-Length` 相同） |
+| `Accept-Ranges: bytes` | 声明支持按段读取（整包响应也带） |
 
-**拒绝规则**（`RANGE_NOT_SATISFIABLE`，HTTP 416，与对象/版本不存在的 404 明确区分）：
+例：对 25 字节对象请求 `Range: bytes=20-999`，响应为
+`206`、`Content-Range: bytes 20-24/25`、`X-Range-Length: 5`、`X-Has-More: false`
+（请求长度超出末尾时自动截断，不视为错误）。客户端续传时只需：`X-Has-More: true`
+就用上一段的 `offset + length` 作为下一段起点继续请求。
 
-- 负偏移、零或负长度、`end < start`、无法识别的 Range 格式；
-- 起始位置 ≥ 对象长度（空对象的任何范围也因此被拒绝）。
+服务层 `ObjectStorageService.readLatest / readVersion / readLatestRange / readVersionRange`
+统一返回 `RangeData(version, totalSize, offset, length, hasMore, stream)`，字段与上述响应头
+一一对应：整包读取时 `offset=0, length=totalSize, hasMore=false`。
+
+### 失败分类（三类稳定、可区分的返回）
+
+| 情况 | errorCode | HTTP | 客户端建议 |
+|---|---|---|---|
+| Range **写法本身非法**：负偏移、零/负长度、起止颠倒（`bytes=5-2`）、`bytes=-0`、无法识别的 Range 头 | `INVALID_RANGE` | **400** | 请求写错了，修正范围参数后重试 |
+| 写法合法，但**起始位置已达到/超过对象长度**（`bytes=100-*` 而对象只有 10 字节；空对象的任何范围同理） | `RANGE_NOT_SATISFIABLE` | **416** | 对象已读到头，重试无意义，应提示用户“到末尾了” |
+| 对象不存在 / 版本不存在 / 底层内容缺失 | `OBJECT_NOT_FOUND` / `VERSION_NOT_FOUND` / `CONTENT_MISSING` | **404** | 资源问题，与范围写法无关 |
+
+分类在两个阶段完成，保证语义稳定：HTTP 头先做**写法**解析（非法立即 400）；
+通过写法校验后，由服务层在对象锁内对照“该版本的实际长度”判定起点越界（416）。
+因此即使对象不存在，`bytes=5-2` 这类请求仍先得到 400 `INVALID_RANGE`；
+而对不存在对象发一个写法合法的范围请求，得到的是 404 `OBJECT_NOT_FOUND`。
 
 **内存约束**：整包与按段下载均为流式输出（定界 `InputStream` + `StreamingResponseBody`），
 堆占用是固定的小缓冲区，与对象大小无关——几百 MB 的对象连续读取也不会顶高堆
@@ -122,11 +145,16 @@ Range: bytes=-500       # 最后 500 字节
 
 - 每个对象、每个会话、每个内容各有一把锁；并发上传相同内容只会落盘一份（去重命中日志可查）。
 - **读钉（pin）机制**：读取流（整包与范围读取共用）打开前对内容加钉，关闭时释放；
-  回收线程只删除 `refCount == 0 且无读钉` 的内容。因此读取与删除/回滚/回收交错时，
-  **要么得到完整一致的一段数据，要么以 `CONTENT_MISSING`/`OBJECT_NOT_FOUND` 等明确失败，
-  绝不返回半截或拼接错位的内容**（有交错单测覆盖）。
-- 范围读取在对象锁内解析版本并打开定界流，版本解析与内容加钉是原子的，
-  不会读到“版本 A 的长度 + 版本 B 的内容”这类错位组合。
+  回收线程只删除 `refCount == 0 且无读钉` 的内容。因此读取与**删除 / 回滚 / 回收**交错时，
+  **要么得到完整一致的一段数据，要么以 `CONTENT_MISSING`/`OBJECT_NOT_FOUND`/`VERSION_NOT_FOUND`
+  等明确失败，绝不返回半截或拼接错位的内容**（有真实交错单测覆盖）。
+- 范围请求在**同一把对象锁内**完成「版本解析 → 范围对照该版本长度解析 → 内容加钉打开定界流」
+  三步，是一个原子步骤：不会读到“版本 A 的长度 + 版本 B 的内容”这类错位组合，也消除了
+  先查长度再读之间的 TOCTOU 窗口。**回滚正在进行时的按段读取同样满足**：回滚只是“以历史
+  版本内容追加一个新版本”，读钉保证被读版本的内容在流关闭前不会被回收，读流的长度与内容
+  必定来自同一个版本。
+- 定界读取流在打开时先按内容定位偏移，定位与读取都经过长度计数（`remaining`），
+  区间之外的字节不会泄漏、区间之内的字节不会少给。
 - 分片与元数据全部通过“临时文件 + 原子 rename”落盘，任何中断（进程崩溃、异常）
   都不会留下可见的半成品对象；未完成/中止/过期的上传不产生可见对象。
 - `StorageGarbageCollector` 按 `local-storage.gc-interval` 周期回收过期会话与不可达内容。
@@ -160,9 +188,14 @@ Range: bytes=-500       # 最后 500 字节
 ## 本地验证
 
 ```bash
-# 运行全部测试（29 个：乱序/重复分片、校验失败、过期、并发、删除回滚交错、
-# 范围读取边界与非法范围、边读边删/边回收、大对象内存上界、崩溃重启对账、GC 等）
+# 运行全部测试（36 个：乱序/重复分片、校验失败、过期、并发、删除回滚交错、
+# 范围读取（开头/结尾/跨分片边界/单字节/空对象/各类非法范围）、
+# “按段读取 + 删除 + 回滚 + 回收”真实交错、范围读取 HTTP 契约（200/206/400/416/404）、
+# 大对象内存上界、崩溃重启对账、GC 等）
 mvn test
+
+# 只跑范围读取相关（服务层 + HTTP 契约）
+mvn test -Dtest='RangeReadTest,HttpRangeReadTest'
 
 # 启动服务
 mvn spring-boot:run
@@ -177,13 +210,19 @@ printf 'hello-' | curl -s -X PUT "localhost:8080/api/storage/sessions/$SID/parts
   -H 'Content-Type: application/octet-stream' --data-binary @-
 curl -s -X POST localhost:8080/api/storage/sessions/$SID/complete
 
-# 整包下载（流式，200）
-curl -s localhost:8080/api/storage/objects/demo.txt/data
+# 整包下载（流式，200；四个 X- 头直接给出总长度/本次区间/hasMore）
+curl -s -D- localhost:8080/api/storage/objects/demo.txt/data
 
-# 范围下载（206，带 Content-Range）
+# 范围下载（206，带 Content-Range 与 X-Object-Total-Size / X-Range-Offset /
+# X-Range-Length / X-Has-More）
 curl -s -D- -H 'Range: bytes=1-3' localhost:8080/api/storage/objects/demo.txt/data
-# 非法范围 / 起点越界（416）
+
+# 范围写法非法 → 400 {"errorCode":"INVALID_RANGE",...}
+curl -s -D- -H 'Range: bytes=3-1' localhost:8080/api/storage/objects/demo.txt/data
+# 写法合法但起点越界 → 416 {"errorCode":"RANGE_NOT_SATISFIABLE",...}
 curl -s -D- -H 'Range: bytes=100-200' localhost:8080/api/storage/objects/demo.txt/data
+# 对象不存在 → 404 {"errorCode":"OBJECT_NOT_FOUND",...}
+curl -s -D- -H 'Range: bytes=0-1' localhost:8080/api/storage/objects/nope/data
 ```
 
 单测日志（`log.info`）会打印上传会话 ID、分片编号、sha256 校验依据、

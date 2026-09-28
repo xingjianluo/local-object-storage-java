@@ -17,6 +17,9 @@ public class StorageException extends RuntimeException {
         OBJECT_NOT_FOUND,
         VERSION_NOT_FOUND,
         CONTENT_MISSING,
+        /** 范围写法本身非法（负偏移、零/负长度、起止颠倒、Range 头无法解析），HTTP 400。 */
+        INVALID_RANGE,
+        /** 范围写法合法，但起始位置已达到或超过对象长度（空对象的任何范围同理），HTTP 416。 */
         RANGE_NOT_SATISFIABLE,
         STORAGE_CORRUPT
     }
